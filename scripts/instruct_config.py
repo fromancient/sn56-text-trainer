@@ -275,10 +275,11 @@ def get_training_json(train_info: dict) -> dict:
     if max_length is not None:
         train_request["max_length"] = max_length
     train_request["packing_mode"] = run_config.get("packing_mode", "fa")
+
+    if param_nums < 1_000_000_000:
         train_request["min_steps"] = max(
             int(train_info["hours_to_complete"] * 100), train_request["min_steps"]
         )
-
     elif param_nums < 9_000_000_000:
         train_request["min_steps"] = max(
             int(train_info["hours_to_complete"] * 70), train_request["min_steps"]
