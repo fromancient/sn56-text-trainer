@@ -3,6 +3,7 @@ from copy import deepcopy
 from lr_finder import estimate_starting_lr
 from adaptive_max_length import compute_max_length, compute_prompt_length, scale_batch_for_max_length
 from strategy_router import build_runtime_profile, apply_family_rules, resolve_size_bucket
+from task_diagnosis import diagnose_task
 
 DPO_CONFIG = {
     "sub_1b": {"lr": 3e-5, "distributed": "ddp", "gpu_count": 1, "batch_size": 10},
@@ -108,6 +109,7 @@ def get_training_json(train_info: dict) -> dict:
     profile = build_runtime_profile(
         model_name, model_path, "DpoTask", train_info.get("hours_to_complete", 2)
     )
+    diagnosis = diagnose_task(train_info, "DpoTask")
     config = get_config(param_nums, profile)
 
     model_max_pos = None
@@ -136,7 +138,7 @@ def get_training_json(train_info: dict) -> dict:
     _bs, lr = apply_family_rules(model_name, model_path, _bs, config["lr"])
 
     run_config = {
-        "epoch_num": 2 if param_nums < 4_000_000_000 else 1,
+        "epoch_num": diagnosis["dpo_epochs"],
         "batch_size": _bs,
         "learning_rate": lr,
         "min_lr_rate": profile["min_lr_rate"],
@@ -153,7 +155,7 @@ def get_training_json(train_info: dict) -> dict:
         "gradient_accumulation_steps": 2,
         "max_length": max_length,
         "max_prompt_length": max_prompt_length,
-        "beta": 0.08,
+        "beta": diagnosis["dpo_beta"],
         "use_attn_implementation": "kernels-community/vllm-flash-attn3" if train_info.get("is_openai", False) else ""
     }
     
@@ -191,7 +193,8 @@ def get_training_json(train_info: dict) -> dict:
     train_request["adjust_batch_size"] = False
     train_request["periodic_save_steps"] = 500
     train_request["checking_step"] = 80
-    
+    train_request["task_diagnosis"] = diagnosis
+
     return {
         "train_request": train_request,
         "run_cmd": run_cmd

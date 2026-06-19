@@ -9,6 +9,7 @@ from copy import deepcopy
 from lr_finder import estimate_starting_lr
 from adaptive_max_length import compute_max_length, scale_batch_for_max_length
 from strategy_router import build_runtime_profile, apply_family_rules
+from task_diagnosis import diagnose_task
 
 
 FIXED_BS_CONFIG = {
@@ -175,11 +176,22 @@ def get_training_json(train_info: dict) -> dict:
     profile = build_runtime_profile(
         model_name, model_path, "InstructTextTask", train_info.get("hours_to_complete", 2)
     )
+    diagnosis = diagnose_task(train_info, "InstructTextTask")
     config = get_instruct_config(param_nums, profile)
     warmup_steps = profile["warmup_steps"]
 
+    instruct_mode = diagnosis["instruct_mode"]
+    epoch_num = 3
+    if instruct_mode == "kl_conservative":
+        epoch_num = 2
+        config["use_lora"] = config.get("use_lora", False) or param_nums >= 2_000_000_000
+    elif instruct_mode == "small_data":
+        epoch_num = 3
+    elif instruct_mode == "long_context":
+        epoch_num = 2
+
     run_config = {
-        "epoch_num": 3,
+        "epoch_num": epoch_num,
         "batch_size": config["batch_size"],
         "learning_rate": config["lr"],
         "min_lr_rate": profile["min_lr_rate"],
@@ -205,6 +217,19 @@ def get_training_json(train_info: dict) -> dict:
     run_config["batch_size"], run_config["learning_rate"] = apply_family_rules(
         model_name, model_path, run_config["batch_size"], run_config["learning_rate"]
     )
+
+    if instruct_mode == "kl_conservative":
+        kl_scale = 0.55 if diagnosis.get("kl_coef", 0.1) >= 0.1 else 0.65
+        run_config["learning_rate"] *= kl_scale
+        run_config["batch_size"] = max(1, int(run_config["batch_size"] * 0.85))
+        print(
+            f"[instruct_config] KL mode: lr×{kl_scale}, epochs={epoch_num}",
+            flush=True,
+        )
+    elif instruct_mode == "small_data":
+        run_config["learning_rate"] *= 1.08
+    elif instruct_mode == "long_context":
+        run_config["learning_rate"] *= 0.92
 
     if model_name in FIXED_BS_CONFIG:
         run_config["batch_size"] = FIXED_BS_CONFIG[model_name]["batch_size"]
@@ -275,6 +300,7 @@ def get_training_json(train_info: dict) -> dict:
     if max_length is not None:
         train_request["max_length"] = max_length
     train_request["packing_mode"] = run_config.get("packing_mode", "fa")
+    train_request["task_diagnosis"] = diagnosis
 
     if param_nums < 1_000_000_000:
         train_request["min_steps"] = max(

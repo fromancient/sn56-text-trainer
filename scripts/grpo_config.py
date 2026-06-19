@@ -10,6 +10,7 @@ from model_utility import (
 from copy import deepcopy
 from adaptive_max_length import compute_max_length, scale_batch_for_max_length
 from strategy_router import build_runtime_profile, resolve_size_bucket
+from task_diagnosis import diagnose_task
 
 GRPO_CONFIG = {
     "0_1_b": {
@@ -151,6 +152,7 @@ def get_grpo_config(param_nums: int, profile: dict | None = None) -> dict:
         key = "40_80_b"
 
     base = deepcopy(GRPO_CONFIG.get(key, GRPO_CONFIG["40_80_b"]))
+    base["label"] = key
     if profile and profile.get("use_lora"):
         base["use_lora"] = True
     if param_nums >= 15_000_000_000:
@@ -257,8 +259,10 @@ def get_training_json(train_info: dict) -> dict:
     profile = build_runtime_profile(
         model_name, model_path, "GrpoTask", train_info.get("hours_to_complete", 2)
     )
+    diagnosis = diagnose_task(train_info, "GrpoTask")
     config = get_grpo_config(param_nums, profile)
     warmup_steps = profile["warmup_steps"]
+    grpo_profile = diagnosis["grpo_profile"]
 
     run_config = {
         "epoch_num": 1,
@@ -300,17 +304,36 @@ def get_training_json(train_info: dict) -> dict:
         dataset_path=train_info.get("dataset"),
     )
     max_completion_length = min(512, max(128, max_prompt_length // 2))
+
+    if grpo_profile == "exact_match":
+        max_completion_length = min(256, max_completion_length)
+        run_config["learning_rate"] *= 0.85
+    elif grpo_profile == "math_reasoning":
+        max_completion_length = min(640, max(384, max_completion_length))
+        run_config["learning_rate"] *= 0.75
+    elif grpo_profile == "code_execution":
+        max_completion_length = min(768, max(512, max_completion_length))
+        run_config["learning_rate"] *= 0.80
+    elif grpo_profile == "multi_reward":
+        run_config["learning_rate"] *= 0.90
+        run_config["num_generations"] = 2
+    elif grpo_profile == "slow_external":
+        run_config["use_vllm"] = False
+
     run_config["batch_size"] = scale_batch_for_max_length(
         run_config["batch_size"], max_prompt_length + max_completion_length, 1024
     )
 
     train_request = deepcopy(train_info)
-    train_request["save_before_remaining_time"] = 3
+    train_request["save_before_remaining_time"] = (
+        12 if grpo_profile == "slow_external" else 3
+    )
     train_request["min_steps"] = 80
     train_request["adjust_batch_size"] = False
     train_request["periodic_save_steps"] = 500
     train_request["max_prompt_length"] = max_prompt_length
     train_request["max_completion_length"] = max_completion_length
+    train_request["task_diagnosis"] = diagnosis
 
     if if_contain_slow_reward_function(train_info["dataset_type"]):
         train_request["save_before_remaining_time"] = 12

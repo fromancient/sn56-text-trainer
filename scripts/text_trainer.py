@@ -45,6 +45,7 @@ from dpo_config import get_training_json as get_dpo_training_json
 from grpo_config import get_training_json as get_grpo_training_json
 from strategy_router import route_task_strategy
 from supplemental_mixer import maybe_blend_supplemental
+from dpo_dataset_filter import filter_dpo_dataset
 import pathlib
 from transformers import AutoConfig
 import lr_utils
@@ -222,6 +223,12 @@ def _apply_oom_fallback(
                 train_cmd
                 + " --load_in_4bit True --use_bnb_nested_quant True --bnb_4bit_quant_type nf4"
             )
+
+    if attempt >= 7:
+        epochs = extract_value_from_cmd(train_cmd, "num_train_epochs")
+        if epochs and int(float(epochs)) > 1:
+            print("[oom-fallback] step7 reduce epochs to 1", flush=True)
+            train_cmd = replace_args_in_cmd(train_cmd, "num_train_epochs", "1") or train_cmd
 
     return train_cmd
 
@@ -415,6 +422,8 @@ def main():
 
     dataset_path = train_paths.get_text_dataset_path(args.task_id)
     dataset_path = maybe_blend_supplemental(dataset_path, args.task_id)
+    if args.task_type == TaskType.DPOTASK.value:
+        dataset_path = filter_dpo_dataset(dataset_path, dataset_type_dict)
     submission_dir = train_paths.get_checkpoints_output_path(
         args.task_id, args.expected_repo_name
     )
