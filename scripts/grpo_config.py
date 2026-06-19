@@ -8,7 +8,8 @@ from model_utility import (
     get_gpu_count,
 )
 from copy import deepcopy
-from adaptive_max_length import compute_max_length
+from adaptive_max_length import compute_max_length, scale_batch_for_max_length
+from strategy_router import build_runtime_profile, resolve_size_bucket
 
 GRPO_CONFIG = {
     "0_1_b": {
@@ -125,38 +126,37 @@ def if_contain_slow_reward_function(dataset_type: dict) -> bool:
     return False
 
 
-def get_grpo_config(param_nums: int) -> dict:
+def get_grpo_config(param_nums: int, profile: dict | None = None) -> dict:
     if param_nums < 1_000_000_000:
-        return GRPO_CONFIG["0_1_b"]
+        key = "0_1_b"
     elif param_nums < 2_000_000_000:
-        return GRPO_CONFIG["1_2_b"]
+        key = "1_2_b"
     elif param_nums < 4_000_000_000:
-        return GRPO_CONFIG["2_4_b"]
+        key = "2_4_b"
     elif param_nums < 5_000_000_000:
-        return GRPO_CONFIG["4_5_b"]
+        key = "4_5_b"
     elif param_nums < 6_000_000_000:
-        return GRPO_CONFIG["5_6_b"]
+        key = "5_6_b"
     elif param_nums < 9_000_000_000:
-        return GRPO_CONFIG["6_9_b"]
+        key = "6_9_b"
     elif param_nums < 12_000_000_000:
-        return GRPO_CONFIG["9_12_b"]
+        key = "9_12_b"
     elif param_nums < 15_000_000_000:
-        return GRPO_CONFIG["12_15_b"]
+        key = "12_15_b"
     elif param_nums < 20_000_000_000:
-        return GRPO_CONFIG["15_20_b"]
+        key = "15_20_b"
     elif param_nums < 40_000_000_000:
-        return GRPO_CONFIG["20_40_b"]
-    elif param_nums < 80_000_000_000:
-        return GRPO_CONFIG["40_80_b"]
+        key = "20_40_b"
     else:
-        print(f"Model size {param_nums} is not supported")
-        return {
-            "lr": 4e-5,
-            "distributed": "ds",
-            "gpu_count": 8,
-            "batch_size": 6,
-            "use_lora": True,
-        }
+        key = "40_80_b"
+
+    base = deepcopy(GRPO_CONFIG.get(key, GRPO_CONFIG["40_80_b"]))
+    if profile and profile.get("use_lora"):
+        base["use_lora"] = True
+    if param_nums >= 15_000_000_000:
+        base["use_vllm"] = False
+        base["use_4bit"] = True
+    return base
 
 
 def contain_python_execution(dataset_type: dict) -> bool:
@@ -254,34 +254,34 @@ def get_training_json(train_info: dict) -> dict:
     model_path = train_info["model_path"]
     model_architecture = get_model_architecture(model_path)
     param_nums = get_model_num_params(model_name, model_path)
-    config = get_grpo_config(param_nums)
-    print(f"config: {config}")
-    # Time-aware warmup: ~60 steps/hour cap, refined in train script with 3% ratio
-    hours = train_info.get("hours_to_complete", 2)
-    warmup_steps = max(10, min(200, int(hours * 60)))
+    profile = build_runtime_profile(
+        model_name, model_path, "GrpoTask", train_info.get("hours_to_complete", 2)
+    )
+    config = get_grpo_config(param_nums, profile)
+    warmup_steps = profile["warmup_steps"]
 
     run_config = {
-        "epoch_num": 4,
-        "batch_size": config["batch_size"],
-        "learning_rate": config["lr"],
-        "min_lr_rate": 0.25,
+        "epoch_num": 1,
+        "batch_size": 1,
+        "learning_rate": min(config["lr"], 1e-5),
+        "min_lr_rate": profile["min_lr_rate"],
         "warmup_steps": warmup_steps,
         "use_liger": get_use_liger(model_architecture),
         "optimizer": "paged_adamw_8bit",
-        "use_lora": config.get("use_lora", False),
+        "use_lora": True,
         "disable_fa": disable_flash_attention(model_architecture, model_name),
         "gpu_nums": config["gpu_count"],
         "output_dir": train_info["output_dir"],
         "request_path": train_info["request_path"],
         "distributed": config.get("distributed", "ddp"),
         "gradient_checkpointing": get_gradient_checkpointing(model_name),
-        "gradient_accumulation_steps": 4,
-        "vllm_gpu_memory_utilization": config.get("vllm_gpu_memory_utilization", 0.4),
+        "gradient_accumulation_steps": 12,
+        "vllm_gpu_memory_utilization": min(config.get("vllm_gpu_memory_utilization", 0.35), 0.45),
         "num_generations": 2,
-        "beta": 0.5,
+        "beta": 0.08,
         "use_vllm": get_use_vllm(model_architecture, model_name, model_path),
         "tensor_parallel": config.get("tensor_parallel", False),
-        "use_4bit": config.get("use_4bit", False),
+        "use_4bit": config.get("use_4bit", param_nums >= 12_000_000_000),
     }
 
     if model_name == "OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5":
@@ -290,22 +290,27 @@ def get_training_json(train_info: dict) -> dict:
     if "starcoder" in model_name.lower():
         run_config["batch_size"] = int(run_config["batch_size"] / 1.5)
 
-    # Adaptive max_prompt_length from dataset prompt length distribution
     baseline_stats = train_info.get("baseline_stats")
-    if baseline_stats is not None:
-        dataset_stats = baseline_stats.get("dataset", {})
-        prompt_dist = dataset_stats.get("prompt_length_distribution")
-        max_prompt_length = compute_max_length(prompt_dist, default=512, packing=False)
-    else:
-        max_prompt_length = None
+    dataset_stats = (baseline_stats or {}).get("dataset", {})
+    prompt_dist = dataset_stats.get("prompt_length_distribution")
+    max_prompt_length = compute_max_length(
+        prompt_dist,
+        default=1024,
+        packing=False,
+        dataset_path=train_info.get("dataset"),
+    )
+    max_completion_length = min(512, max(128, max_prompt_length // 2))
+    run_config["batch_size"] = scale_batch_for_max_length(
+        run_config["batch_size"], max_prompt_length + max_completion_length, 1024
+    )
 
     train_request = deepcopy(train_info)
     train_request["save_before_remaining_time"] = 3
-    train_request["min_steps"] = 100
+    train_request["min_steps"] = 80
     train_request["adjust_batch_size"] = False
     train_request["periodic_save_steps"] = 500
-    if max_prompt_length is not None:
-        train_request["max_prompt_length"] = max_prompt_length
+    train_request["max_prompt_length"] = max_prompt_length
+    train_request["max_completion_length"] = max_completion_length
 
     if if_contain_slow_reward_function(train_info["dataset_type"]):
         train_request["save_before_remaining_time"] = 12
@@ -358,8 +363,8 @@ def get_training_json(train_info: dict) -> dict:
             )
 
     total_batch_size = run_config["batch_size"] * run_config["gpu_nums"]
-    if total_batch_size < 64:
-        run_config["gradient_accumulation_steps"] = min(4, int(64 / total_batch_size))
+    if total_batch_size < 32:
+        run_config["gradient_accumulation_steps"] = max(8, int(32 / max(total_batch_size, 1)))
 
     run_config["eval_batch_size"] = 4
     if run_config["batch_size"] <= 4:

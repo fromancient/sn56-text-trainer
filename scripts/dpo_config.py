@@ -1,123 +1,35 @@
 from model_utility import get_model_architecture, get_model_num_params, get_use_liger, disable_flash_attention, get_gradient_checkpointing, get_gpu_count
 from copy import deepcopy
 from lr_finder import estimate_starting_lr
-from adaptive_max_length import compute_max_length
+from adaptive_max_length import compute_max_length, compute_prompt_length, scale_batch_for_max_length
+from strategy_router import build_runtime_profile, apply_family_rules, resolve_size_bucket
 
 DPO_CONFIG = {
-    "0_1_b": {
-        "lr": 1.35e-5,
-        "distributed": "ddp",
-        "gpu_count": 1,
-        "batch_size": 16,
-    },
-    "1_2_b": {
-        "lr": 8.7e-6,
-        "distributed": "ddp",
-        "gpu_count": 1,
-        "batch_size": 12,
-    },
-    "2_4_b": {
-        "lr": 6.5e-6,
-        "distributed": "ddp",
-        "gpu_count": 2,
-        "batch_size": 12,
-        "use_lora": True
-    },
-    "4_5_b": {
-        "lr": 6.25e-6,
-        "distributed": "ddp",
-        "gpu_count": 4,
-        "batch_size": 12,
-        "use_lora": True
-    },
-    "5_9_b": {
-        "lr": 7.5e-6,
-        "distributed": "ddp",
-        "gpu_count": 4,
-        "batch_size": 8,
-        "use_lora": True
-    },
-    "9_12_b": {
-        "lr": 5e-6,
-        "distributed": "ds",
-        "gpu_count": 4,
-        "use_lora": True,
-        "batch_size": 32,
-        "gradient_checkpointing": False
-    },
-    "12_14_b": {
-        "lr": 8.5e-6,
-        "distributed": "ds",
-        "gpu_count": 4,
-        "use_lora": True,
-        "batch_size": 24,
-        "gradient_checkpointing": False
-    },
-    "14_15_b": {
-        "lr": 8.5e-6,
-        "distributed": "ds",
-        "gpu_count": 8,
-        "use_lora": True,
-        "batch_size": 18,
-        "gradient_checkpointing": False
-    },
-    "15_40_b": {
-        "lr": 8e-6,
-        "distributed": "ds",
-        "gpu_count": 8,
-        "use_lora": True,
-        "batch_size": 16,
-        "gradient_checkpointing": False
-    },
-    "40_80_b": {
-        "lr": 8e-6,
-        "distributed": "ds",
-        "gpu_count": 8,
-        "use_lora": True,
-        "batch_size": 8,
-        "gradient_checkpointing": False
-    }        
+    "sub_1b": {"lr": 3e-5, "distributed": "ddp", "gpu_count": 1, "batch_size": 10},
+    "1_2b": {"lr": 2e-5, "distributed": "ddp", "gpu_count": 1, "batch_size": 8},
+    "2_4b": {"lr": 1.2e-5, "distributed": "ddp", "gpu_count": 2, "batch_size": 6, "use_lora": True},
+    "4_9b": {"lr": 8e-6, "distributed": "ddp", "gpu_count": 2, "batch_size": 5, "use_lora": True},
+    "9_12b": {"lr": 6e-6, "distributed": "ds", "gpu_count": 4, "use_lora": True, "batch_size": 8},
+    "12_40b": {"lr": 5e-6, "distributed": "ds", "gpu_count": 8, "use_lora": True, "batch_size": 4},
+    "40_80b": {"lr": 5e-6, "distributed": "ds", "gpu_count": 8, "use_lora": True, "batch_size": 2},
 }
 
 for key in DPO_CONFIG:
     DPO_CONFIG[key]["label"] = key
     
 
-def get_config(param_nums: int) -> dict:
-    result = None
-    if param_nums < 1_000_000_000:
-        result = DPO_CONFIG["0_1_b"]
-    elif param_nums < 2_000_000_000:
-        result = DPO_CONFIG["1_2_b"]
-    elif param_nums < 4_000_000_000:
-        result = DPO_CONFIG["2_4_b"]
-    elif param_nums < 5_000_000_000:
-        result = DPO_CONFIG["4_5_b"]
-    elif param_nums < 9_000_000_000:
-        result = DPO_CONFIG["5_9_b"]
-    elif param_nums < 12_000_000_000:
-        result = DPO_CONFIG["9_12_b"]
-    elif param_nums < 14_000_000_000:
-        result = DPO_CONFIG["12_14_b"]
-    elif param_nums < 15_000_000_000:  
-        result = DPO_CONFIG["14_15_b"]
-    elif param_nums < 35_000_000_000:
-        result = DPO_CONFIG["15_40_b"]
-    elif param_nums < 80_000_000_000:
-        result = DPO_CONFIG["40_80_b"]
-    else:
-        print(f"Model size {param_nums} is not supported", flush=True)
-        result = {
-            "lr": 4e-5,
-            "distributed": "ds",
-            "gpu_count": 8,
-            "batch_size": 6,
-            "use_lora": True
-        }
-    if param_nums < 4_000_000_000 and param_nums > 1_330_000_000:
-        result["gpu_count"] = 2
-    if param_nums > 13_330_000_000: # 8 GPUs for 13.3B
-        result["gpu_count"] = 8
+def get_config(param_nums: int, profile: dict | None = None) -> dict:
+    bucket = (profile or {}).get("size_bucket") or resolve_size_bucket(param_nums or 4_000_000_000)
+    result = deepcopy(
+        DPO_CONFIG.get(
+            bucket,
+            {"lr": 4e-6, "distributed": "ds", "gpu_count": 8, "batch_size": 2, "use_lora": True},
+        )
+    )
+    if profile:
+        if profile.get("use_lora"):
+            result["use_lora"] = True
+        result["distributed"] = profile.get("distributed", result.get("distributed", "ddp"))
     return result
 
 
@@ -193,10 +105,11 @@ def get_training_json(train_info: dict) -> dict:
     model_path = train_info["model_path"]
     model_architecture = get_model_architecture(model_path)
     param_nums = get_model_num_params(model_name, model_path)
-    config = get_config(param_nums)
+    profile = build_runtime_profile(
+        model_name, model_path, "DpoTask", train_info.get("hours_to_complete", 2)
+    )
+    config = get_config(param_nums, profile)
 
-    # Adaptive max_length from dataset sequence length distribution.
-    # Can go above defaults when model supports it.
     model_max_pos = None
     try:
         from transformers import AutoConfig
@@ -206,58 +119,41 @@ def get_training_json(train_info: dict) -> dict:
         pass
 
     baseline_stats = train_info.get("baseline_stats")
-    if baseline_stats is not None:
-        dataset_stats = baseline_stats.get("dataset", {})
-        seq_dist = dataset_stats.get("seq_length_distribution")
-        max_length = compute_max_length(
-            seq_dist, default=1024, packing=False,
-            model_max_length=model_max_pos,
-        )
-        chosen_dist = dataset_stats.get("chosen_length_distribution")
-        if chosen_dist and seq_dist:
-            chosen_p99 = chosen_dist.get("p99", 0)
-            total_p99 = seq_dist.get("p99", 0)
-            estimated_prompt_p99 = max(total_p99 - chosen_p99, total_p99 // 2)
-            prompt_dist = {"p99": estimated_prompt_p99, "p50": estimated_prompt_p99 // 2}
-            max_prompt_length = compute_max_length(prompt_dist, default=512, packing=False)
-        else:
-            max_prompt_length = min(512, max_length // 2)
-    else:
-        max_length = 1024
-        max_prompt_length = 512
+    dataset_stats = (baseline_stats or {}).get("dataset", {})
+    seq_dist = dataset_stats.get("seq_length_distribution")
+    max_length = compute_max_length(
+        seq_dist,
+        default=1024,
+        packing=False,
+        model_max_length=model_max_pos,
+        dataset_path=train_info.get("dataset"),
+    )
+    max_prompt_length = compute_prompt_length(max_length, ratio=0.65)
 
-    # Time-aware warmup: ~60 steps/hour cap, refined in train script with 3% ratio
-    hours = train_info.get("hours_to_complete", 2)
-    warmup_steps = max(10, min(200, int(hours * 60)))
-
-    # Scale batch size down when max_length is high to avoid OOM.
-    # DPO processes chosen+rejected (2x sequences), so memory scales fast.
-    # Reference: bs=12 fits at max_length=1024 on 80GB GPU for 1.5B model.
-    _ref_maxlen = 1024
-    _bs = config["batch_size"]
-    if max_length > _ref_maxlen:
-        _scale = _ref_maxlen / max_length
-        _bs = max(1, int(_bs * _scale))
-        print(f"[sn56][dpo-bs] max_length={max_length} > {_ref_maxlen}, batch {config['batch_size']} -> {_bs}", flush=True)
+    warmup_steps = profile["warmup_steps"]
+    _bs = max(1, config["batch_size"] // 2)
+    _bs = scale_batch_for_max_length(_bs, max_length, reference=1024)
+    _bs, lr = apply_family_rules(model_name, model_path, _bs, config["lr"])
 
     run_config = {
-        "epoch_num": 3,
+        "epoch_num": 2 if param_nums < 4_000_000_000 else 1,
         "batch_size": _bs,
-        "learning_rate": config["lr"],
-        "min_lr_rate": 0.25,
+        "learning_rate": lr,
+        "min_lr_rate": profile["min_lr_rate"],
         "warmup_steps": warmup_steps,
         "use_liger": get_use_liger(model_architecture),
         "optimizer": "paged_adamw_8bit",
-        "use_lora": config.get("use_lora", False),
+        "use_lora": config.get("use_lora", profile.get("use_lora", False)),
         "disable_fa": disable_flash_attention(model_architecture, model_name),
         "gpu_nums": config["gpu_count"],
         "output_dir": train_info["output_dir"],
         "request_path": train_info["request_path"],
         "distributed": config.get("distributed", "ddp"),
         "gradient_checkpointing": get_gradient_checkpointing(model_name),
-        "gradient_accumulation_steps": 1,
+        "gradient_accumulation_steps": 2,
         "max_length": max_length,
         "max_prompt_length": max_prompt_length,
+        "beta": 0.08,
         "use_attn_implementation": "kernels-community/vllm-flash-attn3" if train_info.get("is_openai", False) else ""
     }
     

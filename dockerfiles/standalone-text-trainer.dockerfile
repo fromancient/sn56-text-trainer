@@ -22,7 +22,7 @@ WORKDIR /workspace/scripts
 # Copy current folder to /workspace/auto_ml
 COPY scripts /workspace/scripts
 # Make entrypoint script executable
-RUN chmod +x /workspace/scripts/entrypoint.sh
+RUN chmod +x /workspace/scripts/entrypoint.sh /workspace/scripts/run_text_trainer.sh
 # Pytorch (Auto-selects backend https://docs.astral.sh/uv/guides/integration/pytorch/#automatic-backend-selection)
 
 # Create a virtual environment for data generation
@@ -46,4 +46,4 @@ RUN pip install uv && \
     uv pip install vllm==0.8.3 --system && \
     pip install "fiber @ git+https://github.com/rayonlabs/fiber.git@2.4.0"
 
-ENTRYPOINT ["./entrypoint.sh"]
+ENTRYPOINT ["./run_text_trainer.sh"]

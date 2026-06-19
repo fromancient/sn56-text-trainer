@@ -3,12 +3,12 @@ from model_utility import (
     get_model_num_params,
     get_use_liger,
     disable_flash_attention,
-    get_data_size,
     get_gpu_count,
 )
 from copy import deepcopy
 from lr_finder import estimate_starting_lr
-from adaptive_max_length import compute_max_length
+from adaptive_max_length import compute_max_length, scale_batch_for_max_length
+from strategy_router import build_runtime_profile, apply_family_rules
 
 
 FIXED_BS_CONFIG = {
@@ -21,65 +21,52 @@ FIXED_BS_CONFIG = {
 }
 
 INSTRUCT_CONFIG = {
-    "0_1_b": {
-        "lr": 0.0001,
+    "sub_1b": {
+        "lr": 1e-4,
         "distributed": "ddp",
         "gpu_count": 1,
-        "batch_size": 140,
+        "batch_size": 120,
         "use_lora": False,
     },
-    "1_2_b": {
-        "lr": 0.0001,
+    "1_2b": {
+        "lr": 9e-5,
         "distributed": "ddp",
         "gpu_count": 1,
         "use_lora": False,
-        "batch_size": 100,
+        "batch_size": 88,
     },
-    "2_4_b": {
-        "lr": 7.5e-5,
+    "2_4b": {
+        "lr": 8e-5,
         "distributed": "ddp",
         "gpu_count": 1,
-        "batch_size": 48,
+        "batch_size": 44,
     },
-    "4_5_b": {
+    "4_9b": {
+        "lr": 5e-5,
+        "distributed": "ddp",
+        "gpu_count": 2,
+        "batch_size": 26,
+    },
+    "9_12b": {
         "lr": 7e-5,
         "distributed": "ddp",
         "gpu_count": 2,
-        "batch_size": 40,
-    },
-    "5_9_b": {
-        "lr": 3.5e-5,
-        "distributed": "ddp",
-        "gpu_count": 2,
-        "batch_size": 28,
-    },
-    "9_12_b": {
-        "lr": 1e-4,
-        "distributed": "ddp",
-        "gpu_count": 2,
         "use_lora": True,
-        "batch_size": 32,
+        "batch_size": 20,
     },
-    "12_15_b": {
-        "lr": 1e-4,
+    "12_40b": {
+        "lr": 6e-5,
         "distributed": "ds",
         "gpu_count": 4,
         "use_lora": True,
-        "batch_size": 30,
+        "batch_size": 14,
     },
-    "15_40_b": {
-        "lr": 8e-5,
-        "distributed": "ds",
-        "gpu_count": 4,
-        "use_lora": True,
-        "batch_size": 18,
-    },
-    "40_80_b": {
-        "lr": 8e-5,
+    "40_80b": {
+        "lr": 5e-5,
         "distributed": "ds",
         "gpu_count": 8,
         "use_lora": True,
-        "batch_size": 8,
+        "batch_size": 6,
     },
 }
 
@@ -87,37 +74,27 @@ for key in INSTRUCT_CONFIG:
     INSTRUCT_CONFIG[key]["label"] = key
 
 
-def get_instruct_config(param_nums: int) -> dict:
-    result = {
-        "lr": 4e-5,
-        "distributed": "ds",
-        "gpu_count": 8,
-        "batch_size": 6,
-        "use_lora": True,
-    }
-    if param_nums < 1_000_000_000:
-        result = INSTRUCT_CONFIG["0_1_b"]
-    elif param_nums < 2_000_000_000:
-        result = INSTRUCT_CONFIG["1_2_b"]
-    elif param_nums < 4_000_000_000:
-        result = INSTRUCT_CONFIG["2_4_b"]
-    elif param_nums < 5_000_000_000:
-        result = INSTRUCT_CONFIG["4_5_b"]
-    elif param_nums < 9_000_000_000:
-        result = INSTRUCT_CONFIG["5_9_b"]
-    elif param_nums < 12_000_000_000:
-        result = INSTRUCT_CONFIG["9_12_b"]
-    elif param_nums < 15_000_000_000:
-        result = INSTRUCT_CONFIG["12_15_b"]
-    elif param_nums < 35_000_000_000:
-        result = INSTRUCT_CONFIG["15_40_b"]
-    elif param_nums < 80_000_000_000:
-        result = INSTRUCT_CONFIG["40_80_b"]
-    else:
-        print(f"Model size {param_nums} is not supported")
-    result = deepcopy(result)
-    if param_nums < 9_000_000_000 and param_nums > 8_000_000_000:
-        result["batch_size"] = int(2 * result["batch_size"] / 3)
+def get_instruct_config(param_nums: int, profile: dict | None = None) -> dict:
+    from strategy_router import resolve_size_bucket
+
+    bucket = (profile or {}).get("size_bucket") or resolve_size_bucket(param_nums or 4_000_000_000)
+    result = deepcopy(
+        INSTRUCT_CONFIG.get(
+            bucket,
+            {
+                "lr": 4e-5,
+                "distributed": "ds",
+                "gpu_count": 8,
+                "batch_size": 4,
+                "use_lora": True,
+            },
+        )
+    )
+    if profile:
+        result["use_lora"] = profile.get("use_lora", result.get("use_lora", False))
+        result["distributed"] = profile.get("distributed", result.get("distributed", "ddp"))
+    if 4_000_000_000 <= param_nums < 5_000_000_000:
+        result["batch_size"] = int(result["batch_size"] * 1.15)
     return result
 
 
@@ -195,16 +172,17 @@ def get_training_json(train_info: dict) -> dict:
     model_path = train_info["model_path"]
     model_architecture = get_model_architecture(model_path)
     param_nums = get_model_num_params(model_name, model_path)
-    config = get_instruct_config(param_nums)
-    # Time-aware warmup: ~60 steps/hour cap, refined in train script with 3% ratio
-    hours = train_info.get("hours_to_complete", 2)
-    warmup_steps = max(10, min(200, int(hours * 60)))
+    profile = build_runtime_profile(
+        model_name, model_path, "InstructTextTask", train_info.get("hours_to_complete", 2)
+    )
+    config = get_instruct_config(param_nums, profile)
+    warmup_steps = profile["warmup_steps"]
 
     run_config = {
         "epoch_num": 3,
         "batch_size": config["batch_size"],
         "learning_rate": config["lr"],
-        "min_lr_rate": 0.25,
+        "min_lr_rate": profile["min_lr_rate"],
         "warmup_steps": warmup_steps,
         "use_liger": get_use_liger(model_architecture),
         "optimizer": "paged_adamw_8bit",
@@ -224,47 +202,19 @@ def get_training_json(train_info: dict) -> dict:
         ),
     }
 
-    # Non-FA models use naive packing (no Flash Attention varlen isolation).
-    # Still much better than no packing (~2-3x throughput from reduced padding).
-    if run_config["disable_fa"] == "True" or model_architecture.strip().lower() in [
-        "optforcausallm"
-    ]:
-        run_config["packing"] = "True"
-        run_config["packing_mode"] = "naive"
-    else:
-        run_config["packing_mode"] = "fa"
-
-    # data_size = get_data_size(train_info["request_path"])
-
-    # if run_config["disable_fa"]: # if FA is not usable
-    #     run_config["batch_size"] = run_config["batch_size"] * 2
+    run_config["batch_size"], run_config["learning_rate"] = apply_family_rules(
+        model_name, model_path, run_config["batch_size"], run_config["learning_rate"]
+    )
 
     if model_name in FIXED_BS_CONFIG:
         run_config["batch_size"] = FIXED_BS_CONFIG[model_name]["batch_size"]
 
-    if model_architecture.strip().lower() in [
-        "gptneoxforcausallm",
-        "gptjforcausallm",
-        "phiforcausallm",
-        "falconforcausallm",
+    if run_config["disable_fa"] == "True" or model_architecture.strip().lower() in [
+        "optforcausallm"
     ]:
-        run_config["batch_size"] = int(run_config["batch_size"] // 2)
-        if model_name == "EleutherAI/pythia-160m":  # reduce more
-            run_config["batch_size"] = int(run_config["batch_size"] / 1.5)
-        elif "pythia" in model_name.lower():
-            run_config["batch_size"] = int(run_config["batch_size"] / 1.8)
-
-    if model_name in ["microsoft/phi-2", "microsoft/phi-1_5"]:
-        run_config["batch_size"] = int(run_config["batch_size"] / 4)
-
-    if "bloom-560m" in model_name or "bloomz-560m" in model_name:
-        run_config["batch_size"] = 8
-
-    if model_name == "mistralai/Mistral-7B-v0.1":
-        run_config["batch_size"] = int(3 * run_config["batch_size"] / 4)
-
-    if "falcon" in model_name.lower():
-        run_config["batch_size"] = int(run_config["batch_size"] / 2)
+        run_config["packing_mode"] = "naive"
+    else:
+        run_config["packing_mode"] = "fa"
 
     data_per_step = run_config["batch_size"] * run_config["gpu_nums"]
     if data_per_step >= 64:
@@ -287,8 +237,6 @@ def get_training_json(train_info: dict) -> dict:
         if lr is not None:
             run_config["learning_rate"] = lr
 
-    # Adaptive max_length from dataset sequence length distribution.
-    # Can go ABOVE 2048 when the model supports it and data needs it.
     baseline_stats = train_info.get("baseline_stats")
     model_max_pos = None
     try:
@@ -298,28 +246,24 @@ def get_training_json(train_info: dict) -> dict:
     except Exception:
         pass
 
-    if baseline_stats is not None:
-        dataset_stats = baseline_stats.get("dataset", {})
-        seq_dist = dataset_stats.get("seq_length_distribution")
-        packing_enabled = run_config["packing"] == "True"
-        default_max = 2048
-        max_length = compute_max_length(
-            seq_dist, default=default_max, packing=packing_enabled,
-            model_max_length=model_max_pos,
+    dataset_stats = (baseline_stats or {}).get("dataset", {})
+    seq_dist = dataset_stats.get("seq_length_distribution")
+    packing_enabled = run_config["packing"] == "True"
+    default_max = 2048
+    max_length = compute_max_length(
+        seq_dist,
+        default=default_max,
+        packing=packing_enabled,
+        model_max_length=model_max_pos,
+        dataset_path=train_info.get("dataset"),
+    )
+    old_bs = run_config["batch_size"]
+    run_config["batch_size"] = scale_batch_for_max_length(old_bs, max_length, default_max)
+    if run_config["batch_size"] != old_bs:
+        print(
+            f"[instruct_config] max_length={max_length}, batch_size {old_bs} -> {run_config['batch_size']}",
+            flush=True,
         )
-        # Compensate: if max_length went up, reduce batch_size proportionally
-        # to avoid OOM.  Memory scales ~linearly with seq_len (Flash Attention).
-        if max_length > default_max:
-            ratio = default_max / max_length
-            old_bs = run_config["batch_size"]
-            run_config["batch_size"] = max(1, int(old_bs * ratio))
-            print(
-                f"[instruct_config] max_length {default_max} -> {max_length}, "
-                f"batch_size {old_bs} -> {run_config['batch_size']}",
-                flush=True,
-            )
-    else:
-        max_length = None
 
     run_config["learning_rate"] *= train_info["reg_ratio"]
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
@@ -331,8 +275,6 @@ def get_training_json(train_info: dict) -> dict:
     if max_length is not None:
         train_request["max_length"] = max_length
     train_request["packing_mode"] = run_config.get("packing_mode", "fa")
-
-    if param_nums < 1_000_000_000:
         train_request["min_steps"] = max(
             int(train_info["hours_to_complete"] * 100), train_request["min_steps"]
         )

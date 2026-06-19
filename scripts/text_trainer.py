@@ -43,6 +43,8 @@ import training_paths as train_paths
 from instruct_config import get_training_json as get_instruct_training_json
 from dpo_config import get_training_json as get_dpo_training_json
 from grpo_config import get_training_json as get_grpo_training_json
+from strategy_router import route_task_strategy
+from supplemental_mixer import maybe_blend_supplemental
 import pathlib
 from transformers import AutoConfig
 import lr_utils
@@ -151,6 +153,77 @@ def is_openai_model(model_name: str) -> bool:
 
 OOM_ERROR = "torch.OutOfMemoryError: CUDA out of memory"
 VLLM_OOM_ERROR = "ValueError: No available memory for the cache blocks"
+GENERIC_OOM_MARKERS = ("out of memory", "CUDA error", "CUBLAS_STATUS_ALLOC_FAILED")
+
+
+def _apply_oom_fallback(
+    attempt: int,
+    train_cmd: str,
+    log_path: str,
+    task_type: str,
+) -> str:
+    """Six-step OOM recovery ladder (attempt index is 1-based after first failure)."""
+    if attempt == 1:
+        current_batch_size = extract_value_from_cmd(train_cmd, "per_device_train_batch_size")
+        if current_batch_size and int(current_batch_size) > 1:
+            new_batch_size = max(1, int(current_batch_size) // 2)
+            print(f"[oom-fallback] step1 batch {current_batch_size} -> {new_batch_size}", flush=True)
+            return replace_args_in_cmd(train_cmd, "per_device_train_batch_size", str(new_batch_size)) or train_cmd
+
+    if attempt == 2:
+        print("[oom-fallback] step2 force batch_size=1", flush=True)
+        return replace_args_in_cmd(train_cmd, "per_device_train_batch_size", "1") or train_cmd
+
+    if attempt == 3:
+        request_path = extract_value_from_cmd(train_cmd, "request_path")
+        if request_path and os.path.exists(request_path):
+            try:
+                with open(request_path) as f:
+                    req = json.load(f)
+                cur_maxlen = req.get("train_request", {}).get("max_length") or req.get("max_length")
+                if cur_maxlen is None or cur_maxlen > 2048:
+                    new_maxlen = 2048
+                    if "train_request" in req:
+                        req["train_request"]["max_length"] = new_maxlen
+                    else:
+                        req["max_length"] = new_maxlen
+                    with open(request_path, "w") as f:
+                        json.dump(req, f, indent=4, ensure_ascii=False)
+                    print(f"[oom-fallback] step3 max_length -> {new_maxlen}", flush=True)
+            except Exception as e:
+                print(f"[oom-fallback] step3 failed: {e}", flush=True)
+        return train_cmd
+
+    if attempt == 4 and task_type == TaskType.GRPOTASK.value:
+        print("[oom-fallback] step4 disable vLLM", flush=True)
+        return replace_args_in_cmd(train_cmd, "use_vllm", "False") or train_cmd
+
+    if attempt == 5:
+        if " --use_peft" not in train_cmd and task_type in (
+            TaskType.DPOTASK.value,
+            TaskType.GRPOTASK.value,
+            TaskType.INSTRUCTTEXTTASK.value,
+            TaskType.CHATTASK.value,
+        ):
+            print("[oom-fallback] step5 enable LoRA", flush=True)
+            return train_cmd + " --use_peft --lora_r 64 --lora_alpha 256 --lora_target_modules all-linear"
+        if task_type == TaskType.GRPOTASK.value and "load_in_4bit" not in train_cmd:
+            print("[oom-fallback] step5 enable 4-bit", flush=True)
+            return (
+                train_cmd
+                + " --load_in_4bit True --use_bnb_nested_quant True --bnb_4bit_quant_type nf4"
+            )
+
+    if attempt >= 6 and task_type == TaskType.GRPOTASK.value:
+        train_cmd = replace_args_in_cmd(train_cmd, "use_vllm", "False") or train_cmd
+        if "load_in_4bit" not in train_cmd:
+            print("[oom-fallback] step6 GRPO 4-bit + no vLLM", flush=True)
+            return (
+                train_cmd
+                + " --load_in_4bit True --use_bnb_nested_quant True --bnb_4bit_quant_type nf4"
+            )
+
+    return train_cmd
 
 
 def get_error_type(log_path: str):
@@ -158,10 +231,12 @@ def get_error_type(log_path: str):
         text = f.read()
     if OOM_ERROR in text:
         return OOM_ERROR
-    elif VLLM_OOM_ERROR in text:
+    if VLLM_OOM_ERROR in text:
         return VLLM_OOM_ERROR
-    else:
-        return None
+    lowered = text.lower()
+    if any(marker in lowered for marker in GENERIC_OOM_MARKERS):
+        return OOM_ERROR
+    return None
 
 
 def extract_output_dir(train_cmd: str) -> str:
@@ -185,65 +260,13 @@ def run_training(
             f"************* Training attempt {i+1}/{retries} for task {task_id}*************",
             flush=True,
         )
-        if i > 0:  # there was something wrong so we will reduce the batch_size
-            # first check if the training is OOM
+        if i > 0:
             if os.path.exists(log_path):
                 error_type = get_error_type(log_path)
-                if error_type == OOM_ERROR:
-                    current_batch_size = extract_value_from_cmd(
-                        train_cmd, "per_device_train_batch_size"
-                    )
-                    current_batch_size = int(current_batch_size)
-                    if current_batch_size > 1:
-                        new_batch_size = current_batch_size // 2
-                        print(
-                            f"Reducing batch size from {current_batch_size} to {new_batch_size}",
-                            flush=True,
-                        )
-                        train_cmd = replace_args_in_cmd(
-                            train_cmd,
-                            "per_device_train_batch_size",
-                            str(new_batch_size),
-                        )
-                        # print(f"New train command: {train_cmd}", flush=True)
-                    else:
-                        # batch_size=1 and still OOM — try halving max_length
-                        # in the training request.  No re-tokenization needed:
-                        # smart_truncate in MyDataset handles longer sequences.
-                        request_path = extract_value_from_cmd(train_cmd, "request_path")
-                        _did_reduce_maxlen = False
-                        if request_path and os.path.exists(request_path):
-                            try:
-                                with open(request_path) as _f:
-                                    _req = json.load(_f)
-                                cur_maxlen = _req.get("train_request", {}).get("max_length")
-                                if cur_maxlen is not None and cur_maxlen > 2048:
-                                    # Halve max_length, floor at 2048
-                                    new_maxlen = max(2048, cur_maxlen // 2)
-                                    # Align to 64
-                                    new_maxlen = ((new_maxlen + 63) // 64) * 64
-                                    _req["train_request"]["max_length"] = new_maxlen
-                                    with open(request_path, "w") as _f:
-                                        json.dump(_req, _f, indent=4, ensure_ascii=False)
-                                    print(
-                                        f"[sn56][oom-fallback] max_length {cur_maxlen} -> {new_maxlen}",
-                                        flush=True,
-                                    )
-                                    _did_reduce_maxlen = True
-                            except Exception as e:
-                                print(f"[sn56][oom-fallback] Failed to reduce max_length: {e}", flush=True)
-
-                        if not _did_reduce_maxlen:
-                            print(f"batch size is 1, cannot reduce further", flush=True)
-                            if task_type == TaskType.GRPOTASK.value:
-                                # disable vllm
-                                train_cmd = replace_args_in_cmd(
-                                    train_cmd, "use_vllm", "False"
-                                )
-                elif error_type == VLLM_OOM_ERROR:
-                    if task_type == TaskType.GRPOTASK.value:
-                        print(f"VLLM OOM error, disable VLLM", flush=True)
-                        train_cmd = replace_args_in_cmd(train_cmd, "use_vllm", "False")
+                if error_type in (OOM_ERROR, VLLM_OOM_ERROR):
+                    train_cmd = _apply_oom_fallback(i, train_cmd, log_path, task_type)
+                elif error_type == VLLM_OOM_ERROR and task_type == TaskType.GRPOTASK.value:
+                    train_cmd = replace_args_in_cmd(train_cmd, "use_vllm", "False") or train_cmd
 
         # empty the log file if it exists
         if os.path.exists(log_path):
@@ -391,6 +414,7 @@ def main():
         sys.exit(f"Error creating dataset type object: {e}")
 
     dataset_path = train_paths.get_text_dataset_path(args.task_id)
+    dataset_path = maybe_blend_supplemental(dataset_path, args.task_id)
     submission_dir = train_paths.get_checkpoints_output_path(
         args.task_id, args.expected_repo_name
     )
@@ -454,6 +478,11 @@ def main():
         "baseline_stats": baseline_stats,
     }
 
+    try:
+        route_task_strategy(args.task_type)
+    except ValueError as e:
+        sys.exit(str(e))
+
     if (
         args.task_type == TaskType.INSTRUCTTEXTTASK.value
         or args.task_type == TaskType.CHATTASK.value
@@ -474,7 +503,7 @@ def main():
         tokenize_cmd = f"python tokenize_grpo.py {request_path}"
         train_cmd = train_info["run_cmd"]
     else:
-        raise ValueError(f"Task type {args.task_type} not supported")
+        sys.exit(f"Unsupported task type: {args.task_type}")
 
     
     with open(request_path, "w") as f:
