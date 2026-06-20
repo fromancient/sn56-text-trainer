@@ -452,6 +452,14 @@ def main():
         "max_prompt_length", 512
     )  # 512 is the default max_prompt_length of GRPOConfig
     log_info(f"tamanho_max={max_prompt_length}, treino={len(train_ds)}, teste={len(dev_ds)}")
+    max_completion_length = train_request.get(
+        "max_completion_length", getattr(training_args, "max_completion_length", 512)
+    )
+    log_info(
+        f"grpo_gen: max_completion_length={max_completion_length}, "
+        f"temperature={getattr(training_args, 'temperature', None)}, "
+        f"top_p={getattr(training_args, 'top_p', None)}"
+    )
     t1 = datetime.datetime.now()
     train_ds = truncate_prompts(train_ds, tokenizer, max_prompt_length)
     dev_ds = truncate_prompts(dev_ds, tokenizer, max_prompt_length)

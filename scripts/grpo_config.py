@@ -182,6 +182,10 @@ def get_run_cmd(config: dict, gpu_nums: int):
         "vllm_gpu_memory_utilization",
         "num_generations",
         "disable_fa",
+        "max_prompt_length",
+        "max_completion_length",
+        "temperature",
+        "top_p",
     ]
     for key in required_keys:
         if key not in config:
@@ -221,6 +225,10 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --use_liger {use_liger} --num_generations {num_generations} --vllm_mode colocate --vllm_gpu_memory_utilization {vllm_gpu_memory_utilization} \
     --disable_fa {disable_fa} \
     --beta {beta} \
+    --max_prompt_length {max_prompt_length} \
+    --max_completion_length {max_completion_length} \
+    --temperature {temperature} \
+    --top_p {top_p} \
     --dataloader_pin_memory True"""
     )
 
@@ -304,22 +312,40 @@ def get_training_json(train_info: dict) -> dict:
         dataset_path=train_info.get("dataset"),
     )
     max_completion_length = min(512, max(128, max_prompt_length // 2))
+    temperature = 0.6
+    top_p = 0.9
 
     if grpo_profile == "exact_match":
-        max_completion_length = min(256, max_completion_length)
+        max_completion_length = min(256, max(128, max_completion_length))
+        temperature = 0.4
+        top_p = 0.8
         run_config["learning_rate"] *= 0.85
     elif grpo_profile == "math_reasoning":
-        max_completion_length = min(640, max(384, max_completion_length))
+        max_completion_length = min(768, max(512, max_completion_length))
+        temperature = 0.7
+        top_p = 0.95
         run_config["learning_rate"] *= 0.75
     elif grpo_profile == "code_execution":
         max_completion_length = min(768, max(512, max_completion_length))
+        temperature = 0.55
+        top_p = 0.9
         run_config["learning_rate"] *= 0.80
     elif grpo_profile == "multi_reward":
+        max_completion_length = min(512, max(384, max_completion_length))
+        temperature = 0.6
+        top_p = 0.9
         run_config["learning_rate"] *= 0.90
         run_config["num_generations"] = 2
     elif grpo_profile == "slow_external":
+        max_completion_length = min(512, max(256, max_completion_length))
+        temperature = 0.5
+        top_p = 0.85
         run_config["use_vllm"] = False
 
+    run_config["max_prompt_length"] = max_prompt_length
+    run_config["max_completion_length"] = max_completion_length
+    run_config["temperature"] = temperature
+    run_config["top_p"] = top_p
     run_config["batch_size"] = scale_batch_for_max_length(
         run_config["batch_size"], max_prompt_length + max_completion_length, 1024
     )
@@ -368,22 +394,18 @@ def get_training_json(train_info: dict) -> dict:
             run_config["batch_size"] = 12
 
     # Scale batch size with prompt length — memory scales linearly with total
-    # sequence length (prompt + completion). Reference: default TRL GRPOConfig
-    # uses max_prompt_length=512 and max_completion_length=512 → total=1024.
-    # Same 1/S linear scaling used by DPO and instruct.
-    _ref_total = 1024   # 512 prompt + 512 completion (TRL defaults)
-    _default_completion = 512
-    if max_prompt_length is not None:
-        _actual_total = max_prompt_length + _default_completion
-        if _actual_total > _ref_total:
-            _scale = _ref_total / _actual_total
-            _old_bs = run_config["batch_size"]
-            run_config["batch_size"] = max(1, int(_old_bs * _scale))
-            print(
-                f"[sn56][grpo-bs] max_prompt_length={max_prompt_length} > 512, "
-                f"batch {_old_bs} -> {run_config['batch_size']}",
-                flush=True,
-            )
+    # sequence length (prompt + completion).
+    _ref_total = 1024
+    _actual_total = max_prompt_length + max_completion_length
+    if _actual_total > _ref_total:
+        _scale = _ref_total / _actual_total
+        _old_bs = run_config["batch_size"]
+        run_config["batch_size"] = max(1, int(_old_bs * _scale))
+        print(
+            f"[sn56][grpo-bs] total_len={_actual_total} > {_ref_total}, "
+            f"batch {_old_bs} -> {run_config['batch_size']}",
+            flush=True,
+        )
 
     total_batch_size = run_config["batch_size"] * run_config["gpu_nums"]
     if total_batch_size < 32:

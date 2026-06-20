@@ -421,7 +421,12 @@ def main():
         sys.exit(f"Error creating dataset type object: {e}")
 
     dataset_path = train_paths.get_text_dataset_path(args.task_id)
-    dataset_path = maybe_blend_supplemental(dataset_path, args.task_id)
+
+    if args.task_type in (TaskType.INSTRUCTTEXTTASK.value, TaskType.CHATTASK.value):
+        dataset_path = maybe_blend_supplemental(
+            dataset_path, args.task_id, task_type=args.task_type
+        )
+
     if args.task_type == TaskType.DPOTASK.value:
         dataset_path = filter_dpo_dataset(dataset_path, dataset_type_dict)
     submission_dir = train_paths.get_checkpoints_output_path(

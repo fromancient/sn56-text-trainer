@@ -142,7 +142,10 @@ def diagnose_task(train_info: dict, task_type: str) -> dict[str, Any]:
         quality = _dpo_quality(rows, train_info.get("dataset_type", {}))
         diagnosis["dpo_quality"] = quality
         diagnosis["dpo_beta"] = 0.10 if quality["is_clean"] else 0.05
-        diagnosis["dpo_epochs"] = 2 if quality["is_clean"] and dataset_size >= 300 else 1
+        if quality["is_clean"] and dataset_size >= 300:
+            diagnosis["dpo_epochs"] = 3 if param_count < 1_000_000_000 else 2
+        else:
+            diagnosis["dpo_epochs"] = 1
 
     elif task_type == "GrpoTask":
         diagnosis["grpo_profile"] = _grpo_reward_profile(train_info.get("dataset_type", {}))

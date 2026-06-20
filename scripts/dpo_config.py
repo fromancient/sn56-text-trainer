@@ -6,7 +6,7 @@ from strategy_router import build_runtime_profile, apply_family_rules, resolve_s
 from task_diagnosis import diagnose_task
 
 DPO_CONFIG = {
-    "sub_1b": {"lr": 3e-5, "distributed": "ddp", "gpu_count": 1, "batch_size": 10},
+    "sub_1b": {"lr": 3e-5, "distributed": "ddp", "gpu_count": 1, "batch_size": 10, "use_lora": False},
     "1_2b": {"lr": 2e-5, "distributed": "ddp", "gpu_count": 1, "batch_size": 8},
     "2_4b": {"lr": 1.2e-5, "distributed": "ddp", "gpu_count": 2, "batch_size": 6, "use_lora": True},
     "4_9b": {"lr": 8e-6, "distributed": "ddp", "gpu_count": 2, "batch_size": 5, "use_lora": True},
@@ -43,6 +43,7 @@ def get_run_cmd(config: dict, gpu_nums: int):
         "use_liger",
         "optimizer",
         "disable_fa",
+        "beta",
     ]
     for key in required_keys:
         if key not in config:
@@ -71,6 +72,7 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --save_strategy no \
     --logging_steps 5 \
     --learning_rate {learning_rate} \
+    --beta {beta} \
     --weight_decay 0. \
     --warmup_steps {warmup_steps} \
     --lr_scheduler_type cosine_with_min_lr \
