@@ -46,6 +46,7 @@ from grpo_config import get_training_json as get_grpo_training_json
 from strategy_router import route_task_strategy
 from supplemental_mixer import maybe_blend_supplemental
 from dpo_dataset_filter import filter_dpo_dataset
+from grpo_reward_warmup import warm_slow_external_reward_deps
 import pathlib
 from transformers import AutoConfig
 import lr_utils
@@ -513,6 +514,7 @@ def main():
         train_cmd = train_info["run_cmd"]
 
     elif args.task_type == TaskType.GRPOTASK.value:
+        warm_slow_external_reward_deps(dataset_type_dict)
         train_info = get_grpo_training_json(train_info)
         tokenize_cmd = f"python tokenize_grpo.py {request_path}"
         train_cmd = train_info["run_cmd"]

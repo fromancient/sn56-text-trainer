@@ -80,6 +80,22 @@ def _dpo_quality(rows: list[dict], dataset_type: dict) -> dict[str, Any]:
     }
 
 
+_NON_LATIN_RE = re.compile(
+    r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\u0900-\u097F\u4E00-\u9FFF]"
+)
+
+
+def _looks_non_english(rows: list[dict], sample_n: int = 30) -> bool:
+    if not rows:
+        return False
+    hits = 0
+    for row in rows[:sample_n]:
+        blob = " ".join(str(v) for v in row.values())
+        if _NON_LATIN_RE.search(blob):
+            hits += 1
+    return hits / min(len(rows), sample_n) >= 0.35
+
+
 def _grpo_reward_profile(dataset_type: dict) -> str:
     rewards = dataset_type.get("reward_functions") or []
     if not rewards:
@@ -133,6 +149,8 @@ def diagnose_task(train_info: dict, task_type: str) -> dict[str, Any]:
     if task_type in ("InstructTextTask", "ChatTask"):
         if use_kl:
             diagnosis["instruct_mode"] = "kl_conservative"
+        elif _looks_non_english(rows):
+            diagnosis["instruct_mode"] = "non_english"
         elif diagnosis["small_dataset"]:
             diagnosis["instruct_mode"] = "small_data"
         elif diagnosis["long_sequences"]:

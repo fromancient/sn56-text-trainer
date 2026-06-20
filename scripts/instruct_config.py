@@ -226,6 +226,15 @@ def get_training_json(train_info: dict) -> dict:
             f"[instruct_config] KL mode: lr×{kl_scale}, epochs={epoch_num}",
             flush=True,
         )
+    elif instruct_mode == "non_english":
+        run_config["learning_rate"] = 3e-5
+        run_config["use_lora"] = False
+        run_config["epoch_num"] = 3
+        run_config["batch_size"] = max(1, int(run_config["batch_size"] * 0.75))
+        print(
+            f"[instruct_config] non_english: lr=3e-5, full FT, epochs=3",
+            flush=True,
+        )
     elif instruct_mode == "small_data":
         run_config["learning_rate"] *= 1.08
     elif instruct_mode == "long_context":
